@@ -1,0 +1,45 @@
+# =========================
+# Main config
+# =========================
+--config /home/avelasco/FANTASIA/fantasia/config.yaml
+
+# =========================
+# Batches
+# Small test run: first two batches only
+# =========================
+--batches-dir /home/avelasco/FANTASIA/data_sample/uniref50_MF_batches_sorted_500k
+--batch-pattern "*_batch_*.fasta"
+--batch-select 3-last
+
+# =========================
+# Models
+# Small test run: ESM, ESM3c and Ankh3_large only
+# =========================
+--model-select "ESM,ESM3c,Ankh3-Large"
+
+# Base name for the grouped experiment/session
+--session-name-base test_uniref50_MF_sorted_batches
+
+# =========================
+# Execution
+# =========================
+--runner-cmd "poetry run fantasia run"
+
+# =========================
+# Config keys
+# =========================
+--input-key input
+--prefix-key prefix
+--log-path-key log_path
+
+# =========================
+# Runner state and minimal runner logs
+# =========================
+--checkpoint /home/avelasco/fantasia/fantasia_batches_checkpoint_v6_1_test.json
+--logs-dir /home/avelasco/fantasia/fantasia_batch_runner_logs_v6_1_test
+
+# =========================
+# Notes
+# - Live terminal output is ENABLED by default in v6.1
+# - Add --no-live-output only if you want silent terminal mode
+# =========================
