@@ -1,63 +1,85 @@
 #!/usr/bin/env python3
-from __future__ import annotations
 
-import argparse
-import json
-import re
-import shlex
-import shutil
-import subprocess
-import sys
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+# Run FANTASIA sobre múltiples batches FASTA y múltiples modelos, de forma secuencial, con checkpoint.
+
+# General purpose
+#-----------------
+# The script coordinates sequential FANTASIA runs across multiple models and FASTA batches.
+# It temporarily updates selected values in config.yaml, maintains a JSON checkpoint,
+# optionally mirrors process output to the terminal, and organizes experiments and logs.
+
+
+from __future__ import annotations
+# Defers evaluation of type annotations and facilitates modern type syntax.
+
+import argparse # Defines and parses command-line parameters.
+import json # Reads and writes the checkpoint.
+import re # Manages regular expressions for modifying the YAML while preserving the rest of the text.
+import shlex # Splits commands and arguments respecting quotes and shell-style comments.
+import shutil # Copies the backup config and moves experiments to their final destination.
+import subprocess # Executes the FANTASIA command and captures its output.
+import sys # Accesses the arguments, stdout, and exit code.
+from datetime import datetime # Generates timestamp with local timezone.
+from pathlib import Path # Manages paths in a portable and explicit way.
+from typing import Any, Dict, List, Optional, Sequence, Tuple # Documents parameter and return types.
 
 try:
     import yaml
 except ImportError as exc:
     raise SystemExit("ERROR: Este script requiere PyYAML (pip install pyyaml)") from exc
-
-
+# Loads configuration metadata. Concrete YAML edits are applied to the original text rather than through yaml.dump.
 # -----------------------------------------------------------------------------
 # Helpers generales
 # -----------------------------------------------------------------------------
 
 def now_iso() -> str:
+    # Returns local date and time in ISO 8601 format with timezone and second precision.
+    # Used for readable checkpoint and log timestamps.
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+
 def now_compact() -> str:
+    # Returns a compact YYYYMMDDHHMMSS timestamp.
+    # Used in session names, batch directories, and internal prefixes.
     return datetime.now().astimezone().strftime("%Y%m%d%H%M%S")
 
 
 def read_text_exact(path: Path) -> str:
+    # Reads a UTF-8 file without intentionally restructuring its contents.
     return path.read_text(encoding="utf-8")
-
+ 
 
 def write_text_exact(path: Path, text: str) -> None:
+    # Writes UTF-8 text and is the counterpart of read_text_exact.
     path.write_text(text, encoding="utf-8")
 
 
+
 def quote_yaml_scalar(value: str) -> str:
+    # Escapes backslashes, double quotes, and newline characters, then returns a double-quoted YAML scalar.
     escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
     return f'"{escaped}"'
 
 
 def unquote_yaml_scalar(value: str) -> str:
+    # Removes matching single or double quotes. For double-quoted values, it reverses the supported escapes.
     value = value.strip()
     if len(value) >= 2 and ((value[0] == '"' and value[-1] == '"') or (value[0] == "'" and value[-1] == "'")):
-        inner = value[1:-1]
+        inner = value[1:-1] 
         if value[0] == '"':
-            inner = inner.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
+            inner = inner.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\') 
         return inner
     return value
 
 
 def expand_path(value: str) -> Path:
+    # Unquotes a value, expands `~`, and returns an absolute resolved path.
     return Path(unquote_yaml_scalar(value)).expanduser().resolve()
 
 
 def sanitize_label(value: str) -> str:
+    # Replaces characters outside letters, digits, period, underscore, and hyphen with underscores.
     return re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
 
 
@@ -66,6 +88,14 @@ def sanitize_label(value: str) -> str:
 # -----------------------------------------------------------------------------
 
 def replace_single_yaml_key_value_preserving_rest(
+    
+    # Locates a scalar YAML key with a line-based regular expression.
+    # Preserves indentation and inline comments.
+    # Replaces only the scalar value with a quoted value.
+    # Rejects invalid occurrence numbers, missing keys, and ambiguous repeated keys.
+    # Performs sanity checks to ensure text before and after the selected match was not altered.
+    # Returns the previous raw value and the new quoted value.
+
     path: Path,
     key: str,
     new_value: str,
@@ -111,9 +141,12 @@ def replace_single_yaml_key_value_preserving_rest(
 
 
 def read_yaml_scalar_raw(path: Path, key: str, *, occurrence: int = 1) -> str:
-    text = read_text_exact(path)
+    # Reads the raw textual value of a YAML key without modifying the file.
+    # Applies the same ambiguity checks as the replacement helper.
+    # It is available as a utility but is not central to the current main flow.
+    text = read_text_exact(path) 
     pattern = re.compile(
-        rf"^(\s*{re.escape(key)}\s*:\s*)([^#\n]*?)(\s*(?:#.*)?)$",
+        rf"^(\s*{re.escape(key)}\s*:\s*)([^#\n]*?)(\s*(?:#.*)?)$", 
         re.MULTILINE,
     )
     matches = list(pattern.finditer(text))
@@ -130,11 +163,10 @@ def read_yaml_scalar_raw(path: Path, key: str, *, occurrence: int = 1) -> str:
 
 
 def replace_model_enabled_preserving_rest(path: Path, model_name: str, enabled: bool) -> Tuple[str, str]:
-    """
-    Modifica SOLO la línea 'enabled:' dentro del bloque del modelo indicado,
-    preservando el resto del YAML exactamente igual.
-    Devuelve (old_value_raw, new_value_raw).
-    """
+    # Finds a named model block and its nested `enabled` line.
+    # Changes only that line to `True` or `False`.
+    # Stops when indentation indicates that the model block has ended.
+    # Returns the old and new values.
     lines = read_text_exact(path).splitlines(keepends=True)
     model_line_idx: Optional[int] = None
     model_indent: Optional[int] = None
@@ -183,6 +215,8 @@ def replace_model_enabled_preserving_rest(path: Path, model_name: str, enabled: 
 # -----------------------------------------------------------------------------
 
 def load_config_metadata(path: Path) -> Dict[str, Any]:
+    # Loads YAML with yaml.safe_load and verifies that the root is a dictionary.
+    # Used to discover models, base_directory, and log_path.
     with path.open("r", encoding="utf-8") as fh:
         data = yaml.safe_load(fh)
     if not isinstance(data, dict):
@@ -191,6 +225,7 @@ def load_config_metadata(path: Path) -> Dict[str, Any]:
 
 
 def read_state(path: Path) -> Dict[str, Any]:
+    # Loads an existing checkpoint or creates the initial structure with timestamps, INIT stage, current model/batch fields, runs, and history.
     if path.exists():
         with path.open("r", encoding="utf-8") as fh:
             return json.load(fh)
@@ -206,6 +241,7 @@ def read_state(path: Path) -> Dict[str, Any]:
 
 
 def write_state(path: Path, state: Dict[str, Any]) -> None:
+    # Updates `updated_at`, creates the parent directory, writes a temporary JSON file, and atomically replaces the checkpoint.
     state["updated_at"] = now_iso()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -219,6 +255,7 @@ def write_state(path: Path, state: Dict[str, Any]) -> None:
 # -----------------------------------------------------------------------------
 
 def discover_batches(batches_dir: Path, batch_pattern: str) -> List[Path]:
+    # Validates the directory, applies Path.glob, retains files, resolves paths, sorts them, and fails if none are found.
     if not batches_dir.exists():
         raise FileNotFoundError(f"No existe el directorio de batches: {batches_dir}")
     if not batches_dir.is_dir():
@@ -232,6 +269,7 @@ def discover_batches(batches_dir: Path, batch_pattern: str) -> List[Path]:
 
 
 def resolve_selector_token(part: str, total: int) -> int:
+    # Converts `first` to 1, `last` to total, or parses an integer and validates its range.
     value = part.strip().lower()
     if value == "first":
         return 1
@@ -244,6 +282,9 @@ def resolve_selector_token(part: str, total: int) -> int:
 
 
 def parse_batch_select(selector: str, total: int) -> List[int]:
+    # Converts selectors such as `all`, `1`, `last`, `1-5`, `3-last`, and comma-separated combinations into batch positions.
+    # Supports ascending and descending ranges.
+    # Removes duplicates while preserving order.
     selector = selector.strip().lower()
     if not selector or selector == "all":
         return list(range(1, total + 1))
@@ -279,6 +320,7 @@ def parse_batch_select(selector: str, total: int) -> List[int]:
 
 
 def parse_model_select(selector: str, available_models: List[str], enabled_models: List[str]) -> List[str]:
+    # Returns all models for `all`, initially enabled models for `enabled`, or validates an explicit comma-separated list.
     if not selector or selector.strip().lower() == "all":
         return available_models
     if selector.strip().lower() == "enabled":
@@ -294,6 +336,7 @@ def parse_model_select(selector: str, available_models: List[str], enabled_model
 
 
 def load_args_from_txt(args_file: Path) -> List[str]:
+    # Reads the parameter file and uses shlex.split with comment support.
     if not args_file.exists():
         raise FileNotFoundError(f"No existe el archivo de argumentos: {args_file}")
     text = args_file.read_text(encoding="utf-8")
@@ -301,6 +344,9 @@ def load_args_from_txt(args_file: Path) -> List[str]:
 
 
 def expand_args_file(argv: Sequence[str]) -> List[str]:
+    # Performs a preliminary parse for `--args-file`.
+    # When present, parameter-file tokens are prepended to the remaining terminal arguments.
+
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--args-file")
     known, remaining = pre.parse_known_args(list(argv))
@@ -337,6 +383,14 @@ class ModelBatchRunner:
         max_batches: Optional[int],
         session_name_base: Optional[str],
     ) -> None:
+        # Normalizes and stores all parameters.
+        # Defines the backup path and creates the backup if needed.
+        # Loads metadata from the backup rather than from a potentially modified active config.
+        # Supports models under either `models` or `embedding.models`.
+        # Discovers available and initially enabled models.
+        # Reads base_directory and defines experiments_root as base_directory/experiments.
+        # Reads the original log_path.
+        # Resolves selected models and constructs the session name.
         self.config_path = config_path.resolve()
         self.batches_dir = batches_dir.resolve()
         self.batch_pattern = batch_pattern
@@ -401,16 +455,23 @@ class ModelBatchRunner:
         self.session_name = f"{sanitize_label(base_name)}_{self.session_timestamp}"
 
     def ensure_backup(self) -> None:
+        # Verifies that the active configuration exists.
+        # Creates a metadata-preserving copy only when the backup does not already exist.
+        # An old backup is not refreshed automatically.
         if not self.config_path.exists():
             raise FileNotFoundError(f"No existe el config: {self.config_path}")
         if not self.backup_path.exists():
             shutil.copy2(self.config_path, self.backup_path)
 
     def restore_backup(self) -> None:
+        # Copies the backup over the active configuration when the backup exists.
         if self.backup_path.exists():
             shutil.copy2(self.backup_path, self.config_path)
 
     def _set_models_enabled(self, selected_model: str) -> Dict[str, Dict[str, str]]:
+        # Iterates over all known models, enabling only the selected model and disabling the others.
+        # Returns a per-model change record.
+
         changes: Dict[str, Dict[str, str]] = {}
         for model_name in self.available_models:
             desired = (model_name == selected_model)
@@ -428,6 +489,9 @@ class ModelBatchRunner:
         internal_prefix: str,
         final_logs_batch_root: Path,
     ) -> Dict[str, Any]:
+        # Updates the input batch, optional prefix, optional log path, and model enabled flags.
+        # Creates the final log directory before assigning it.
+        # Returns full change metadata for the checkpoint.
         change_info: Dict[str, Any] = {}
 
         old_input_raw, new_input = replace_single_yaml_key_value_preserving_rest(
@@ -476,13 +540,19 @@ class ModelBatchRunner:
         return change_info
 
     def _runner_log_file(self, run_label: str) -> Path:
+        # Creates the runner log directory and returns the sanitized minimal-log path.
         self.runner_logs_dir.mkdir(parents=True, exist_ok=True)
         return self.runner_logs_dir / f"fantasia_runner_{sanitize_label(run_label)}.log"
 
     def _build_cmd(self) -> List[str]:
+        # Splits the configured runner command and appends `--config` with the active YAML path.
         return shlex.split(self.runner_cmd) + ["--config", str(self.config_path)]
 
     def _make_plan(self) -> List[Dict[str, Any]]:
+        # Discovers batches, applies max-batches, applies batch selection, and combines every selected model with every selected batch.
+        # Generates labels, timestamps, prefixes, and final paths.
+        # Produces a JSON-safe plan.
+        # The nesting order is model first, batch second.
         discovered = discover_batches(self.batches_dir, self.batch_pattern)
         if self.max_batches is not None:
             discovered = discovered[: self.max_batches]
@@ -504,24 +574,27 @@ class ModelBatchRunner:
                 final_logs_batch_root = self.logs_root / self.session_name / model_dir_name / final_batch_dir_name
                 plan.append(
                     {
-                        "run_label": run_label,
-                        "model_name": model_name,
-                        "model_dir_name": model_dir_name,
-                        "batch_label": batch_label,
-                        "source_position": pos,
-                        "batch_path": str(batch_path),  # JSON-safe for checkpoint serialization
+                        "run_label": run_label, # Stable label based on model and discovered batch position.
+                        "model_name": model_name, # Selected model.
+                        "model_dir_name": model_dir_name, # Selected directory name.
+                        "batch_label": batch_label, # Position formatted as batch_00001.
+                        "source_position": pos, # Position in the sorted discovered-file list.
+                        "batch_path": str(batch_path), # Absolute FASTA path.
                         "batch_file_name": batch_path.name,
-                        "batch_stem": batch_stem,
-                        "run_stamp": run_stamp,
-                        "final_batch_dir_name": final_batch_dir_name,
-                        "internal_prefix": internal_prefix,
-                        "final_experiment_dir": str(final_experiment_dir),
-                        "final_logs_batch_root": str(final_logs_batch_root),
+                        "batch_stem": batch_stem, # Full filename and filename without its final extension.
+                        "run_stamp": run_stamp, # Compact preparation timestamp.
+                        "final_batch_dir_name": final_batch_dir_name, # Batch stem plus timestamp.
+                        "internal_prefix": internal_prefix, # Temporary prefix used by FANTASIA when creating the experiment.
+                        "final_experiment_dir": str(final_experiment_dir), # Grouped destination of the experiment.
+                        "final_logs_batch_root": str(final_logs_batch_root), # Destination of full FANTASIA logs.
                     }
                 )
         return plan
 
     def _find_created_experiment_dir(self, internal_prefix: str) -> Optional[Path]:
+        # Searches experiments_root for directories beginning with the internal prefix.
+        # Returns the most recently modified match or None.
+
         candidates = [p for p in self.experiments_root.glob(f"{internal_prefix}*") if p.is_dir()]
         if not candidates:
             return None
@@ -529,6 +602,10 @@ class ModelBatchRunner:
         return candidates[0]
 
     def _run_cmd_live_terminal_only(self, cmd: List[str], runner_log: Path) -> int:
+        # Writes a START line to the minimal log.
+        # Launches the process with stderr merged into stdout.
+        # Reads output line by line and mirrors it to the terminal when enabled.
+        # Waits for completion and writes the return code.
         with runner_log.open("a", encoding="utf-8") as log:
             log.write(f"[{now_iso()}] START {' '.join(shlex.quote(x) for x in cmd)}\n")
             log.flush()
@@ -553,6 +630,14 @@ class ModelBatchRunner:
         return rc
 
     def run_single(self, state: Dict[str, Any], run: Dict[str, Any]) -> int:
+        # Executes one model-batch combination.
+        # Records preparation state, applies configuration changes, and records running state.
+        # Builds and stores the effective command.
+        # In dry-run mode, records the command without launching FANTASIA.
+        # On a successful real run, attempts to locate and move the experiment directory.
+        # Records return code, detected source directory, and relocation errors.
+        # Marks the run done for return code zero, even when relocation_error is populated.
+
         run_label = run["run_label"]
         model_name = run["model_name"]
         batch_label = run["batch_label"]
@@ -671,6 +756,12 @@ class ModelBatchRunner:
         return rc
 
     def run(self) -> int:
+        # Loads the checkpoint, creates the plan, and writes session metadata.
+        # Executes runs sequentially and skips entries already marked done.
+        # Stops on the first non-zero result.
+        # Marks ALL_DONE after success.
+        # Handles Ctrl+C as INTERRUPTED with exit code 130.
+        # Restores the configuration in `finally` when enabled.
         state = read_state(self.checkpoint_path)
         plan = self._make_plan()
         state["session_name"] = self.session_name
@@ -715,72 +806,74 @@ class ModelBatchRunner:
 # -----------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
+    # Defines all command-line flags, defaults, and help text.
     ap = argparse.ArgumentParser(
         description=(
-            "Ejecuta FANTASIA sobre batches de un directorio y sobre múltiples modelos, de forma secuencial, "
-            "modificando temporalmente solo las claves necesarias del config.yaml (input, prefix, log_path y enabled) "
-            "y preservando el resto del fichero byte a byte. Por defecto, también refleja en la terminal la salida de FANTASIA mientras se ejecuta."
+            "Runs FANTASIA on batches of files in a directory and on multiple models, sequentially, "
+            "temporarily modifying only the necessary keys in the config.yaml file (input, prefix, log_path and enabled)"
+            "and preserving the rest of the file byte by byte. By default, it also displays FANTASIA’s output in the terminal whilst it is running."
         )
     )
     ap.add_argument(
         "--args-file",
         default=None,
         help=(
-            "Ruta a un TXT con argumentos para el script. El archivo puede contener los mismos flags "
-            "que pondrías en la terminal, con espacios, saltos de línea, comillas y comentarios #."
+            "Path to a TXT file containing arguments for the script. The file may contain the same flags "
+            "that you would enter in the terminal, including spaces, line breaks, quotation marks and # comments."
         ),
     )
-    ap.add_argument("--config", required=True, help="Ruta al config.yaml de FANTASIA")
-    ap.add_argument("--batches-dir", required=True, help="Directorio con los batches FASTA/.fa a procesar")
+    ap.add_argument("--config", required=True, help="Path to FANTASIA's config.yaml file")
+    ap.add_argument("--batches-dir", required=True, help="Directory with the FASTA/.fa batches to process")
     ap.add_argument(
         "--batch-pattern",
         default="*.fa*",
-        help="Patrón glob para descubrir batches dentro de --batches-dir. Por defecto: *.fa*",
+        help="Glob pattern to discover batches within --batches-dir. Default: *.fa*",
     )
     ap.add_argument(
         "--batch-select",
         default="all",
         help=(
-            "Qué batches procesar, usando el orden descubierto en la carpeta. Ejemplos: all, 1, last, 1,last, 1,2, 1-5, 3-last."
+            "Which batches to process, using the order discovered in the folder. Examples: all, 1, last, 1,last, 1,2, 1-5, 3-last."
         ),
     )
     ap.add_argument(
         "--model-select",
         default="all",
         help=(
-            "Qué modelos procesar. Valores soportados: all, enabled o una lista separada por comas, "
-            "por ejemplo: ESM,Prot-T5,ESM3c"
+            "Which models to process. Supported values: all, enabled or a comma-separated list, "
+            "for example: ESM,Prot-T5,ESM3c"
         ),
     )
     ap.add_argument(
         "--session-name-base",
         default=None,
         help=(
-            "Nombre base del experimento agrupador. Se le añadirá automáticamente un timestamp. "
-            "Si no se indica, se usa el nombre del directorio de batches."
+            "Base name for the grouping experiment. A timestamp will be automatically added. "
+            "If not specified, the name of the batches directory will be used."
         ),
     )
-    ap.add_argument("--checkpoint", default="./fantasia_batches_checkpoint.json", help="Ruta al JSON de checkpoint/estado")
-    ap.add_argument("--logs-dir", default="./fantasia_batch_runner_logs", help="Directorio donde se guardará el log minimalista del runner")
-    ap.add_argument("--runner-cmd", default="poetry run fantasia run", help="Comando base. Por defecto: 'poetry run fantasia run'.")
+    ap.add_argument("--checkpoint", default="./fantasia_batches_checkpoint.json", help="Path to the checkpoint/state JSON file")
+    ap.add_argument("--logs-dir", default="./fantasia_batch_runner_logs", help="Directory where the minimalistic runner log will be saved")
+    ap.add_argument("--runner-cmd", default="poetry run fantasia run", help="Base command. Default: 'poetry run fantasia run'.")
 
-    ap.add_argument("--input-key", default="input", help="Clave YAML del FASTA de entrada. Por defecto: input")
-    ap.add_argument("--input-key-occurrence", type=int, default=1, help="Aparición de --input-key a modificar si la clave existe varias veces.")
+    ap.add_argument("--input-key", default="input", help="YAML key for the input FASTA file. Default: input")
+    ap.add_argument("--input-key-occurrence", type=int, default=1, help="Occurrence of --input-key to modify if the key exists multiple times.")
+    ap.add_argument("--prefix-key-occurrence", type=int, default=1, help="Occurrence of --prefix-key to modify if the key exists multiple times.")
 
-    ap.add_argument("--prefix-key", default="prefix", help="Clave YAML del prefijo de salida. Usa '' para no tocar el prefix.")
-    ap.add_argument("--prefix-key-occurrence", type=int, default=1, help="Aparición de --prefix-key a modificar si la clave existe varias veces.")
+    ap.add_argument("--log-path-key", default="log_path", help="YAML key for the FANTASIA logs directory. Default: log_path")
+    ap.add_argument("--log-path-key-occurrence", type=int, default=1, help="Occurrence of --log-path-key to modify if the key exists multiple times.")
 
-    ap.add_argument("--log-path-key", default="log_path", help="Clave YAML donde se define el directorio de logs de FANTASIA. Por defecto: log_path")
-    ap.add_argument("--log-path-key-occurrence", type=int, default=1, help="Aparición de --log-path-key a modificar si la clave existe varias veces.")
-
-    ap.add_argument("--max-batches", type=int, default=None, help="Recorta el conjunto descubierto a los primeros N batches antes de aplicar --batch-select")
-    ap.add_argument("--no-live-output", action="store_true", help="No muestra en la terminal la salida de 'poetry run fantasia run'; solo conserva el runner log minimalista")
-    ap.add_argument("--dry-run", action="store_true", help="Prepara config/checkpoint pero no ejecuta FANTASIA")
-    ap.add_argument("--no-restore-config", action="store_true", help="No restaura el config original al final")
+    ap.add_argument("--max-batches", type=int, default=None, help="Truncates the discovered set to the first N batches before applying --batch-select")
+    ap.add_argument("--no-live-output", action="store_true", help="Does not display FANTASIA's output in the terminal; only saves the minimalistic runner log")
+    ap.add_argument("--dry-run", action="store_true", help="Prepares config/checkpoint but does not execute FANTASIA")
+    ap.add_argument("--no-restore-config", action="store_true", help="Does not restore the original config at the end")
     return ap
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    # Obtains real or supplied arguments, expands the parameter file,
+    # parses options, converts empty prefix/log keys to None, creates ModelBatchRunner,
+    # and calls run().
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     final_argv = expand_args_file(raw_argv)
     args = build_parser().parse_args(final_argv)
@@ -813,4 +906,5 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 if __name__ == "__main__":
+    # Runs main when the file is executed as a program and propagates its result to the shell through SystemExit.
     raise SystemExit(main())

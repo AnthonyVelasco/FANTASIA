@@ -190,168 +190,399 @@ python sort_and_batch_fasta_by_length_v2.py \
 
 # 2. FANTASIA Batch Runner — `run_fantasia_batches_with_checkpoint_REVISED_v6_2_1_monolithic.py`
 
-## Purpose
+## Overview
 
-This monolithic runner executes FANTASIA over a directory of FASTA batches while preserving traceability by:
+`run_fantasia_batches_with_checkpoint_REVISED_v6_2_1_monolithic.py` is a monolithic orchestration script that runs FANTASIA sequentially across multiple FASTA batches and one or more models defined in `config.yaml`.
 
-- **session**,  
-- **model**,  
-- **batch**,  
-- **experiment directory**,  
-- and **FANTASIA log destination**.  
+The script does not replace FANTASIA. It prepares the FANTASIA configuration for each model-batch combination, launches FANTASIA, tracks progress in a JSON checkpoint, and organizes experiment outputs and logs into a reproducible directory hierarchy.
 
-It is designed for large embedding workflows where:
+## Main workflow
 
-- batches have already been prepared,  
-- multiple models must be executed sequentially,  
-- only one model should be active at a time,  
-- and outputs must be organized clearly for later inspection.  
+The runner performs the following steps:
 
----
+1. Reads command-line arguments directly or from a text file passed through `--args-file`.
+2. Creates a backup of `config.yaml` before modifying the active configuration.
+3. Loads the YAML metadata to discover available models and initially enabled models.
+4. Discovers FASTA batches using a glob pattern.
+5. Applies the requested batch and model selections.
+6. Builds an execution plan containing every selected model-batch combination.
+7. For each planned run:
+   - changes the YAML input value to the current FASTA batch;
+   - changes the experiment prefix;
+   - redirects the FANTASIA log path;
+   - enables only the current model and disables the other known models;
+   - updates the checkpoint;
+   - launches FANTASIA;
+   - optionally mirrors FANTASIA output to the terminal;
+   - identifies the experiment directory created by FANTASIA;
+   - moves the experiment into the final session/model/batch hierarchy;
+   - records completion, failure, and relocation information.
+8. Stops if a FANTASIA run returns a non-zero exit code.
+9. Records `INTERRUPTED` when the process receives `Ctrl+C`.
+10. Restores the original configuration at the end unless `--no-restore-config` is used.
 
-## Key features
+## Requirements
 
-### Monolithic implementation
+- Python 3
+- PyYAML
+- FANTASIA installed and available through the configured runner command
+- A valid FANTASIA `config.yaml`
+- A directory containing FASTA batches
+- Read and write permissions for the configuration, checkpoint, log, and experiment directories
 
-This version is fully self-contained in a **single script** and does not depend on wrapper chaining.
-
-### Sequential execution by model and batch
-
-The runner executes:
-
-1. all selected batches for the first selected model,  
-2. then all selected batches for the next model,  
-3. and so on.  
-
-This avoids having multiple embedding models active at the same time.
-
-### Automatic model enable / disable
-
-Before each run, the runner edits the config so that:
-
-- the selected model is set to `enabled: True`,  
-- all other models are set to `enabled: False`.  
-
-### Config compatibility
-
-The runner supports both configuration layouts for model definitions:
-
-#### Root-level layout
-
-```yaml
-models:
-  ESM:
-    enabled: false
-```
-
-#### Nested layout under `embedding`
-
-```yaml
-embedding:
-  models:
-    ESM:
-      enabled: false
-```
-
-This is important because some FANTASIA configurations define models under `embedding.models`.
-
-### Live terminal output
-
-The runner mirrors the output of:
+Syntax check:
 
 ```bash
-poetry run fantasia run
+python3 -m py_compile   run_fantasia_batches_with_checkpoint_REVISED_v6_2_1_monolithic.py
 ```
 
-back to the terminal while the run is still executing.
+## Recommended execution
 
-### Minimal runner log
+Run the script with the supplied parameter file:
 
-The runner keeps a small execution log with high-level events such as:
-
-- start time,  
-- end time,  
-- return code.  
-
-It does **not** duplicate the full FANTASIA internal logs, because FANTASIA already writes its own detailed `info.log` and `debug.log` files.
-
-### Checkpointing
-
-The runner writes a checkpoint JSON containing:
-
-- current stage,  
-- current model,  
-- current batch,  
-- execution plan,  
-- run-level status,  
-- return codes,  
-- final experiment paths,  
-- final log paths,  
-- and relocation errors.  
-
-### Structured output folders
-
-The runner organizes both experiment folders and FANTASIA log folders by:
-
-- session  
-- model  
-- batch  
-
----
-
-## Expected configuration
-
-The runner expects a valid FANTASIA `config.yaml` containing at least:
-
-- `base_directory`  
-- `log_path`  
-- `input`  
-- `prefix`  
-- model definitions under either `models` or `embedding.models`  
-
-### Recommended absolute paths
-
-For robust execution, especially on scratch storage or clusters, it is recommended to use absolute paths for:
-
-- `base_directory`  
-- `log_path`  
-- `constants`  
-
-Example:
-
-```yaml
-log_path: /scratch/avelasco/fantasia/logs/
-constants: /home/avelasco/FANTASIA/fantasia/constants.yaml
-base_directory: /scratch/avelasco/fantasia/
+```bash
+python3 run_fantasia_batches_with_checkpoint_REVISED_v6_2_1_monolithic.py   --args-file params_fantasia_models_v6_1_test.txt
 ```
 
----
+Arguments placed after `--args-file` are also included. Arguments from the text file are loaded first, followed by the remaining terminal arguments.
 
-## How the runner works
+Dry-run example:
 
-For each selected model and batch, the script:
+```bash
+python3 run_fantasia_batches_with_checkpoint_REVISED_v6_2_1_monolithic.py   --args-file params_fantasia_models_v6_1_test.txt   --dry-run
+```
 
-1. updates the input FASTA path in the config,  
-2. updates the experiment prefix,  
-3. updates the FANTASIA log path,  
-4. enables only the selected model,  
-5. launches `poetry run fantasia run --config ...`,  
-6. streams output live to the terminal,  
-7. records run metadata in the checkpoint,  
-8. relocates the created experiment folder into the final session/model/batch hierarchy.  
+## Parameters in the supplied TXT file
 
+### `--config`
+
+```text
+--config /home/avelasco/FANTASIA/fantasia/config.yaml
+```
+
+Path to the main FANTASIA YAML configuration. The runner creates a backup using the suffix:
+
+```text
+.bak_before_batches
+```
+
+For the supplied path, the backup is:
+
+```text
+/home/avelasco/FANTASIA/fantasia/config.yaml.bak_before_batches
+```
+
+The backup is created only when it does not already exist. The active configuration is modified during execution and is restored at the end by default.
+
+### `--batches-dir`
+
+```text
+--batches-dir /home/avelasco/FANTASIA/data_sample/uniref50_MF_batches_sorted_500k
+```
+
+Directory containing the FASTA batch files.
+
+### `--batch-pattern`
+
+```text
+--batch-pattern "*_batch_*.fasta"
+```
+
+Glob pattern used inside `--batches-dir`. Only regular files matching the pattern are retained. Matching files are sorted lexicographically by resolved path.
+
+Use zero-padded numbering, such as `batch_00001`, so lexical and numeric orders are consistent.
+
+### `--batch-select`
+
+```text
+--batch-select 3-last
+```
+
+Selects every discovered batch from position 3 through the last position, inclusive.
+
+Supported forms include:
+
+```text
+all
+1
+first
+last
+1,last
+1,2,5
+1-5
+3-last
+last-first
+```
+
+Positions are one-based. Repeated positions are removed while preserving their first occurrence.
+
+### `--model-select`
+
+```text
+--model-select "ESM,ESM3c,Ankh3-Large"
+```
+
+Selects the listed models. Names must exactly match keys under `models` or `embedding.models` in the YAML.
+
+Special values:
+
+```text
+all      All discovered models
+enabled  Only models enabled in the original backup configuration
+```
+
+For each run, the script sets `enabled: True` only for the current model and sets the other discovered models to `enabled: False`.
+
+### `--session-name-base`
+
+```text
+--session-name-base test_uniref50_MF_sorted_batches
+```
+
+Base name for the grouped session. The runner sanitizes it and appends a timestamp:
+
+```text
+test_uniref50_MF_sorted_batches_YYYYMMDDHHMMSS
+```
+
+If omitted, the batch directory name is used.
+
+### `--runner-cmd`
+
+```text
+--runner-cmd "poetry run fantasia run"
+```
+
+Base command used to launch FANTASIA. The script appends the active configuration path automatically:
+
+```bash
+poetry run fantasia run   --config /home/avelasco/FANTASIA/fantasia/config.yaml
+```
+
+### `--input-key`
+
+```text
+--input-key input
+```
+
+Name of the YAML key containing the input FASTA path. Before every run, its value is replaced with the current batch path.
+
+If the key occurs multiple times, the script stops unless `--input-key-occurrence N` selects a specific occurrence.
+
+### `--prefix-key`
+
+```text
+--prefix-key prefix
+```
+
+YAML key used for the internal experiment prefix. The generated prefix combines the model name, batch name, and a timestamp.
+
+Disable prefix modification with:
+
+```text
+--prefix-key ""
+```
+
+### `--log-path-key`
+
+```text
+--log-path-key log_path
+```
+
+YAML key containing the FANTASIA logging directory. The runner redirects it to a session/model/batch-specific location.
+
+Disable log-path modification with:
+
+```text
+--log-path-key ""
+```
+
+### `--checkpoint`
+
+```text
+--checkpoint /home/avelasco/fantasia/fantasia_batches_checkpoint_v6_1_test.json
+```
+
+JSON state file containing:
+
+- creation and update timestamps;
+- session metadata;
+- selected models and execution plan;
+- current stage, model, and batch;
+- per-run status;
+- effective command;
+- YAML changes;
+- output paths;
+- return codes;
+- relocation errors;
+- event history.
+
+Writes are atomic: the runner writes a temporary file first and then replaces the checkpoint.
+
+When restarted with a compatible checkpoint, runs already marked `done` are skipped.
+
+### `--logs-dir`
+
+```text
+--logs-dir /home/avelasco/fantasia/fantasia_batch_runner_logs_v6_1_test
+```
+
+Directory for the runner's minimal logs. These logs primarily hold start time, end time, return code, and dry-run commands. Full FANTASIA output remains in FANTASIA's own `info.log` and `debug.log` files under the redirected `log_path`.
+
+## Optional parameters not present in the TXT
+
+### `--args-file`
+
+Loads arguments from a shell-like text file. Quotes, line breaks, and `#` comments are supported.
+
+### `--input-key-occurrence N`
+
+Selects which occurrence of the input key to modify when it appears more than once.
+
+### `--prefix-key-occurrence N`
+
+Selects which occurrence of the prefix key to modify.
+
+### `--log-path-key-occurrence N`
+
+Selects which occurrence of the log-path key to modify.
+
+### `--max-batches N`
+
+Restricts discovery to the first `N` batches before applying `--batch-select`.
+
+For example, `--max-batches 10 --batch-select 3-last` processes positions 3 through 10 of the restricted set.
+
+### `--no-live-output`
+
+Prevents FANTASIA output from being mirrored to the terminal. FANTASIA still writes its normal logs.
+
+### `--dry-run`
+
+Prepares the configuration, plan, checkpoint, and runner logs without launching FANTASIA or moving a real experiment directory.
+
+### `--no-restore-config`
+
+Prevents restoration of the original configuration. Without this option, the backup is restored in the runner's `finally` block.
+
+## Execution order
+
+The plan is model-major:
+
+```text
+for each selected model:
+    for each selected batch:
+        run FANTASIA
+```
+
+With the supplied parameters:
+
+```text
+ESM         × batches 3 through last
+ESM3c       × batches 3 through last
+Ankh3-Large × batches 3 through last
+```
+
+All selected ESM batches run first, followed by ESM3c and then Ankh3-Large.
+
+## Checkpoint and restart behavior
+
+Each run is identified as:
+
+```text
+<model>__batch_<NNNNN>
+```
+
+Per-run statuses:
+
+```text
+preparing
+running
+done
+failed
+```
+
+Global stages include:
+
+```text
+INIT
+PREPARE_<MODEL>_<BATCH>
+RUNNING_<MODEL>_<BATCH>
+FAILED_<MODEL>_<BATCH>
+INTERRUPTED
+ALL_DONE
+```
+
+A restart skips entries marked `done`. Use a new checkpoint if batch selection, directory contents, or ordering changes, because run labels use model name and discovered batch position rather than a content hash.
+
+## YAML preservation strategy
+
+The runner attempts to preserve the YAML byte for byte except for these values:
+
+- `input`;
+- `prefix`;
+- `log_path`;
+- model `enabled` flags.
+
+Scalar keys are edited with regular expressions that preserve indentation and inline comments. The runner aborts if a key is ambiguous and no explicit occurrence is supplied.
+
+## Error handling
+
+- A non-zero FANTASIA return code marks the run `failed` and stops the plan.
+- A relocation failure is recorded in `relocation_error`. In the current implementation, a zero FANTASIA return code still marks the run `done` even when relocation failed, so this field must be reviewed.
+- `Ctrl+C` records `INTERRUPTED` and returns exit code 130.
+- The configuration is restored in `finally` unless restoration is disabled.
+
+## Operational recommendations
+
+1. Start with `--dry-run`.
+2. Confirm that the batch pattern discovers exactly the intended files.
+3. Use zero-padded batch numbers.
+4. Do not reuse checkpoints across incompatible plans.
+5. Verify exact model names against the YAML.
+6. Keep an independent copy of the configuration backup.
+7. Run long jobs inside `screen` or `tmux`.
+8. Review both `return_code` and `relocation_error` in the checkpoint.
+
+## Example with `screen`
+
+```bash
+screen -S fantasia_batches
+
+python3 run_fantasia_batches_with_checkpoint_REVISED_v6_2_1_monolithic.py   --args-file params_fantasia_models_v6_1_test.txt
+```
+
+Detach without stopping:
+
+```text
+Ctrl+A, D
+```
+
+Reconnect:
+
+```bash
+screen -r fantasia_batches
+```
 ---
 
 ## Output structure
 
-### Experiment outputs
+### Experiments
 
-Experiment outputs are stored under:
+The YAML must define `base_directory`. The runner assumes that FANTASIA creates experiments under:
 
 ```text
-<base_directory>/experiments/<session_name>/<model_name>/<batch_name>_<runstamp>/
+<base_directory>/experiments
 ```
 
+The runner then moves each experiment to:
+
+```text
+<base_directory>/experiments/
+  <session_name>/
+    <model_name>/
+      <batch_stem>_<timestamp>/
+```
 Example:
 
 ```text
@@ -362,6 +593,23 @@ Example:
     │   └── uniref50_MF_sorted_batch_00002_20260514132440/
     └── ESM3c/
         └── uniref50_MF_sorted_batch_00001_20260514132440/
+```
+
+### Full FANTASIA logs
+
+The runner uses the original `log_path` as the root and redirects logs to:
+
+```text
+<log_path>/
+  <session_name>/
+    <model_name>/
+      <batch_stem>_<timestamp>/
+```
+
+### Minimal runner logs
+
+```text
+<logs-dir>/fantasia_runner_<model>__batch_<NNNNN>.log
 ```
 
 ### FANTASIA log outputs
